@@ -3,13 +3,15 @@ from django.shortcuts import render
 # Create your views here.
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import AllowAny, IsAuthenticated
+from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework.response import Response
 from django.utils import timezone
 from .models import User, OTP, FormSubmission
 from .serializers import FormSubmissionSerializer
 from .utils import generate_otp, get_expiry_time
-
-from rest_framework_simplejwt.tokens import RefreshToken
+from django.contrib.auth.models import User
+import cloudinary.uploader
+from .utils import validate_resume, validate_image
 
 
 @api_view(['POST'])
@@ -21,10 +23,8 @@ def send_otp(request):
     if not email and not phone:
         return Response({"error": "Email or phone required"}, status=400)
 
-    user, created = User.objects.get_or_create(
-        email=email if email else None,
-        phone=phone if phone else None
-    )
+    user, created = User.objects.get_or_create(username=email, email=email)
+
 
     otp_code = generate_otp()
     expiry = get_expiry_time()
@@ -72,18 +72,76 @@ def verify_otp(request):
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def submit_form(request):
-    serializer = FormSubmissionSerializer(data=request.data)
+    name = request.data.get("name")
+    age = request.data.get("age")
+    resume = request.FILES.get("resume")
+    image = request.FILES.get("image")
 
-    if serializer.is_valid():
-        serializer.save(user=request.user)
-        return Response(serializer.data, status=201)
+    if not all([name, age, resume, image]):
+        return Response({"error": "All fields are required"}, status=400)
 
-    return Response(serializer.errors, status=400)
+    is_valid_resume, resume_error = validate_resume(resume)
+    if not is_valid_resume:
+        return Response({"error": resume_error}, status=400)
+
+    is_valid_image, image_error = validate_image(image)
+    if not is_valid_image:
+        return Response({"error": image_error}, status=400)
+
+    resume_upload = cloudinary.uploader.upload(resume, resource_type="raw")
+    image_upload = cloudinary.uploader.upload(image, resource_type="image")
+
+    form = FormSubmission.objects.create(
+        user=request.user,
+        name=name,
+        age=age,
+        resume_url=resume_upload["secure_url"],
+        image_url=image_upload["secure_url"]
+    )
+
+    return Response({
+        "message": "Form submitted successfully",
+        "data": {
+            "id": form.id,
+            "name": form.name,
+            "age": form.age,
+            "resume_url": form.resume_url,
+            "image_url": form.image_url,
+        }
+    }, status=201)
 
 
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 def my_data(request):
-    data = FormSubmission.objects.filter(user=request.user)
-    serializer = FormSubmissionSerializer(data, many=True)
+    submissions = FormSubmission.objects.filter(user=request.user).order_by('-created_at')
+    serializer = FormSubmissionSerializer(submissions, many=True)
     return Response(serializer.data)
+
+
+@api_view(['DELETE'])
+@permission_classes([IsAuthenticated])
+def delete_submission(request, pk):
+    try:
+        submission = FormSubmission.objects.get(pk=pk, user=request.user)
+    except FormSubmission.DoesNotExist:
+        return Response({"error": "Not found"}, status=404)
+
+    # Extract Cloudinary public IDs
+    resume_url = submission.resume_url
+    image_url = submission.image_url
+
+    def get_public_id(url):
+        return url.split('/')[-1].split('.')[0]
+
+    resume_public_id = get_public_id(resume_url)
+    image_public_id = get_public_id(image_url)
+
+    # Delete from Cloudinary
+    cloudinary.uploader.destroy(resume_public_id, resource_type="raw")
+    cloudinary.uploader.destroy(image_public_id, resource_type="image")
+
+    # Delete DB record
+    submission.delete()
+
+    return Response({"message": "Submission deleted successfully"})
